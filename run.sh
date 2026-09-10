@@ -1,2 +1,1 @@
-g++ -std=c++23 -g main.cpp -o main
-./main
+g++ -std=c++23 -g -Wall -Wextra -fsanitize=address,undefined main.cpp -o main && ./main
