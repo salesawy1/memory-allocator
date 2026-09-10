@@ -3,6 +3,7 @@
 #include <sys/mman.h>
 #include <exception>
 #include <cstdint>
+#include <cstddef>
 #include <utility>
 #include <new>
 #include <mutex>
@@ -22,6 +23,12 @@
 // explicit free list
 
 struct BlockHeader; // forward decl
+
+constexpr size_t ALIGNMENT = alignof(std::max_align_t);
+
+constexpr size_t align_up(size_t n) {
+    return (n + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+}
 
 struct BlockFooter {
     size_t block_size;
@@ -121,6 +128,12 @@ constexpr size_t METADATA_SIZE = sizeof(FreeBlockHeader) + sizeof(BlockFooter);
 constexpr size_t METADATA_SIZE_ALLOC = sizeof(BlockHeader) + sizeof(BlockFooter);
 constexpr size_t INITIAL_ALLOCATOR_SIZE = 4096;
 constexpr size_t MINIMUM_PAYLOAD_SIZE = 4;
+constexpr size_t MINIMUM_BLOCK_SIZE = align_up(METADATA_SIZE + MINIMUM_PAYLOAD_SIZE);
+
+// block starts and header sizes are both multiples of ALIGNMENT, so any padding a
+// payload needs is one too and is either zero or wide enough to hold a size_t
+static_assert(sizeof(BlockHeader) % ALIGNMENT == 0);
+static_assert(ALIGNMENT >= sizeof(size_t));
 
 template <typename T>
 class CustomAllocator {
@@ -180,19 +193,27 @@ public:
     // allocate n objects of type t
     T* allocate(size_t n) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if(n > SIZE_MAX / sizeof(T))
+            throw std::bad_alloc();
         size_t required_size = n * sizeof(T);
+        size_t alignment = alignof(T) < ALIGNMENT ? ALIGNMENT : alignof(T);
         if(!head_)
             throw std::bad_alloc();
-        if(required_size + METADATA_SIZE_ALLOC > size_)
+        if(required_size > size_ - METADATA_SIZE_ALLOC)
             throw std::bad_alloc();
 
+        // block sizes are rounded so that every header and footer lands on an aligned
+        // address and the low bit of the size stays free for the allocated flag
         size_t padding_needed = 0;
+        size_t allocated_block_size = 0;
         FreeBlockHeader* curr_block = head_;
         while(curr_block) {
-            size_t payload_size = curr_block->get_payload_size();
-            size_t padding = get_alignment_offset(curr_block->get_payload_ptr(), alignof(T));
-            if(padding + required_size <= payload_size) {
+            unsigned char* start = reinterpret_cast<unsigned char*>(curr_block);
+            size_t padding = get_alignment_offset(start + sizeof(BlockHeader), alignment);
+            size_t total = align_up(METADATA_SIZE_ALLOC + padding + required_size);
+            if(total <= curr_block->get_block_size()) {
                 padding_needed = padding;
+                allocated_block_size = total;
                 break;
             }
             curr_block = curr_block->ptrs.next;
@@ -200,12 +221,10 @@ public:
         if(!curr_block)
             throw std::bad_alloc();
 
-        // total size for allocated block (header + payload + footer)
-        size_t allocated_block_size = METADATA_SIZE_ALLOC + required_size + padding_needed;
         size_t original_size = curr_block->get_block_size();
 
         // split free block if enough room
-        if(original_size - allocated_block_size >= MINIMUM_PAYLOAD_SIZE + METADATA_SIZE)
+        if(original_size - allocated_block_size >= MINIMUM_BLOCK_SIZE)
             split_block(curr_block, allocated_block_size, original_size - allocated_block_size);
         else {
             remove_from_free_list(curr_block);
@@ -213,13 +232,17 @@ public:
         }
 
         // mark block as allocated and set padding
-        BlockHeader* block = reinterpret_cast<BlockHeader*>(curr_block);
-        block->change_allocation(true);
+        BlockHeader* block = new(reinterpret_cast<void*>(curr_block)) BlockHeader(allocated_block_size, true);
         block->padding = padding_needed;
         BlockFooter* footer = get_block_footer(block);
-        footer->change_allocation(true);
+        new(footer) BlockFooter(allocated_block_size, true);
 
-        return reinterpret_cast<T*>(block->get_payload_ptr());
+        // an over aligned t pushes the payload past the header, so leave the distance
+        // back to the header in the word right in front of the payload. with no padding
+        // that word is the header's own padding field, otherwise it lands in the gap
+        unsigned char* payload = block->get_payload_ptr();
+        *reinterpret_cast<size_t*>(payload - sizeof(size_t)) = padding_needed;
+        return reinterpret_cast<T*>(payload);
     }
 
     void deallocate(T* p) {
@@ -229,12 +252,11 @@ public:
             throw std::logic_error("pointer to deallocate is outside bounds");
         
         BlockHeader* block = get_block_header(p);
-        block->change_allocation(false);
+        size_t block_size = block->get_block_size();
+        get_block_footer(block)->change_allocation(false);
         // convert allocated block to free block
         FreeBlockHeader* free_block = new(reinterpret_cast<void*>(block))
-                                     FreeBlockHeader(block->get_block_size(), false);
-        free_block->ptrs.next = nullptr;
-        free_block->ptrs.prev = nullptr;
+                                     FreeBlockHeader(block_size, false);
 
         perform_coalescence(free_block);
     }
@@ -298,12 +320,12 @@ private:
         );
     }
     inline BlockHeader* get_block_header(T* ptr) const noexcept {
-        return reinterpret_cast<BlockHeader*>(
-            reinterpret_cast<unsigned char*>(ptr) - sizeof(BlockHeader)
-        );
+        unsigned char* payload = reinterpret_cast<unsigned char*>(ptr);
+        size_t padding = *reinterpret_cast<size_t*>(payload - sizeof(size_t));
+        return reinterpret_cast<BlockHeader*>(payload - sizeof(BlockHeader) - padding);
     }
 
-    inline size_t get_alignment_offset(unsigned char* ptr, size_t alignment = alignof(max_align_t)) const noexcept {
+    inline size_t get_alignment_offset(unsigned char* ptr, size_t alignment) const noexcept {
         uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
         size_t offset = (alignment - (addr % alignment)) % alignment;
         return offset;
