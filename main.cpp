@@ -334,50 +334,61 @@ private:
     void merge(FreeBlockHeader* left, FreeBlockHeader* right) noexcept {
         remove_from_free_list(right);
         size_t new_size = left->get_block_size() + right->get_block_size();
-        left->resize(new_size);
         BlockFooter* footer = get_block_footer(right);
+        left->resize(new_size);
         footer->resize(new_size);
     }
 
+    void push_front(FreeBlockHeader* block) noexcept {
+        block->ptrs.prev = nullptr;
+        block->ptrs.next = head_;
+        if(head_)
+            head_->ptrs.prev = block;
+        head_ = block;
+    }
+
     void perform_coalescence(FreeBlockHeader* block) noexcept {
+        // merging backwards keeps the block that was already on the free list, only
+        // a block that did not merge that way still needs linking in
+        bool linked = false;
         FreeBlockHeader* before_block = get_prev_block(block);
         if(before_block && !before_block->is_allocated()) {
             merge(before_block, block);
             block = before_block;
+            linked = true;
         }
         FreeBlockHeader* after_block = get_next_block(block);
         if(after_block && !after_block->is_allocated())
             merge(block, after_block);
-        if(!block->ptrs.next && !block->ptrs.prev && head_ != block) {
-            block->ptrs.next = head_;
-            if(head_)
-                head_->ptrs.prev = block;
-            head_ = block;
-        }
+        if(!linked)
+            push_front(block);
     }
 
     void split_block(FreeBlockHeader* block, size_t left_block_size, size_t right_block_size) {
+        unsigned char* start = reinterpret_cast<unsigned char*>(block);
         size_t original_size = block->get_block_size();
-        BlockFooter* left_footer = reinterpret_cast<BlockFooter*>(
-            reinterpret_cast<unsigned char*>(block) + left_block_size - sizeof(BlockFooter)
-        );
+        FreeBlockHeader* prev = block->ptrs.prev;
+        FreeBlockHeader* next = block->ptrs.next;
+
+        BlockFooter* left_footer = reinterpret_cast<BlockFooter*>(start + left_block_size - sizeof(BlockFooter));
         new(left_footer) BlockFooter(left_block_size, false);
         // update the left block header with new size
         block->resize(left_block_size);
-        unsigned char* right_block_ptr = reinterpret_cast<unsigned char*>(block) + left_block_size;
-        FreeBlockHeader* new_block_header = new(right_block_ptr) FreeBlockHeader(right_block_size, false);
-        BlockFooter* right_footer = reinterpret_cast<BlockFooter*>(
-            reinterpret_cast<unsigned char*>(block) + original_size - sizeof(BlockFooter)
-        );
+
+        FreeBlockHeader* new_block_header = new(start + left_block_size) FreeBlockHeader(right_block_size, false);
+        BlockFooter* right_footer = reinterpret_cast<BlockFooter*>(start + original_size - sizeof(BlockFooter));
         new(right_footer) BlockFooter(right_block_size, false);
+
+        // the right half takes the left half's place in the list, it needs the old
+        // links as well or everything past it drops off the free list
+        new_block_header->ptrs.prev = prev;
+        new_block_header->ptrs.next = next;
+        if(prev)
+            prev->ptrs.next = new_block_header;
+        if(next)
+            next->ptrs.prev = new_block_header;
         if(block == head_)
             head_ = new_block_header;
-        else {
-            if(block->ptrs.prev)
-                block->ptrs.prev->ptrs.next = new_block_header;
-            if(block->ptrs.next)
-                block->ptrs.next->ptrs.prev = new_block_header;
-        }
         block->ptrs.next = nullptr;
         block->ptrs.prev = nullptr;
     }
